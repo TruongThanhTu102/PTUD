@@ -5,6 +5,7 @@ require_once __DIR__ . '/../model/mHoSo.php';
 // Đọc dữ liệu từ file CSV hoặc XLSX
 function docBang(string $file, string $ext): array
 {
+    // Đọc file CSV
     if ($ext === 'csv') {
         $f = fopen($file, 'r');
 
@@ -13,19 +14,21 @@ function docBang(string $file, string $ext): array
         }
 
         $head = fgetcsv($f, 0, ',');
+        $sep = ',';
 
+        // Hỗ trợ CSV dùng dấu chấm phẩy
         if ($head && count($head) === 1) {
             rewind($f);
             $head = fgetcsv($f, 0, ';');
             $sep = ';';
-        } else {
-            $sep = ',';
         }
 
         $rows = [];
 
-        while (($r = fgetcsv($f, 0, $sep)) !== false) {
-            $rows[] = $r;
+        while (($row = fgetcsv($f, 0, $sep)) !== false) {
+            if ($row !== [null]) {
+                $rows[] = $row;
+            }
         }
 
         fclose($f);
@@ -33,81 +36,166 @@ function docBang(string $file, string $ext): array
         return [$head, $rows];
     }
 
-    if ($ext !== 'xlsx' || !class_exists('ZipArchive')) {
+    // Chỉ chấp nhận Excel .xlsx
+    if ($ext !== 'xlsx') {
         throw new RuntimeException(
-            'Chỉ hỗ trợ CSV hoặc XLSX (cần bật ZipArchive).'
+            'Chỉ hỗ trợ file .csv hoặc .xlsx.'
         );
     }
 
-    $z = new ZipArchive();
-
-    if ($z->open($file) !== true) {
-        throw new RuntimeException('Không đọc được file XLSX.');
+    // Kiểm tra extension PHP
+    if (
+        !class_exists('ZipArchive') ||
+        !function_exists('simplexml_load_string')
+    ) {
+        throw new RuntimeException(
+            'PHP cần bật ZipArchive và SimpleXML để đọc Excel.'
+        );
     }
 
-    $shared = [];
-    $ss = $z->getFromName('xl/sharedStrings.xml');
+    $zip = new ZipArchive();
 
-    if ($ss !== false) {
-        $xml = simplexml_load_string($ss);
+    if ($zip->open($file) !== true) {
+        throw new RuntimeException(
+            'Không mở được file Excel .xlsx.'
+        );
+    }
+
+    try {
+        $ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+
+        // Đọc shared strings của Excel
+        $shared = [];
+        $sharedXml = $zip->getFromName('xl/sharedStrings.xml');
+
+        if ($sharedXml !== false) {
+            $xml = simplexml_load_string($sharedXml);
+
+            if ($xml === false) {
+                throw new RuntimeException(
+                    'Dữ liệu chuỗi trong Excel không hợp lệ.'
+                );
+            }
+
+            foreach ($xml->children($ns)->si as $si) {
+                $si->registerXPathNamespace('x', $ns);
+
+                $parts = $si->xpath('.//x:t') ?: [];
+
+                $shared[] = implode(
+                    '',
+                    array_map(
+                        fn($part) => (string)$part,
+                        $parts
+                    )
+                );
+            }
+        }
+
+        // Đọc sheet đầu tiên
+        $sheetXml = $zip->getFromName(
+            'xl/worksheets/sheet1.xml'
+        );
+
+        if ($sheetXml === false) {
+            throw new RuntimeException(
+                'Không tìm thấy sheet1 trong file Excel.'
+            );
+        }
+
+        $xml = simplexml_load_string($sheetXml);
 
         if ($xml === false) {
-            $z->close();
-            throw new RuntimeException('Dữ liệu Excel không hợp lệ.');
+            throw new RuntimeException(
+                'Nội dung file Excel không hợp lệ.'
+            );
         }
 
-        foreach ($xml->si as $si) {
-            $v = '';
 
-            foreach ($si->xpath('.//t') as $t) {
-                $v .= (string)$t;
+        // Đọc các dòng dữ liệu trong Excel bằng XPath
+        $all = [];
+
+        $xml->registerXPathNamespace('x', $ns);
+
+        $excelRows = $xml->xpath(
+            '//x:sheetData/x:row'
+        ) ?: [];
+
+        foreach ($excelRows as $row) {
+
+            $vals = [];
+
+            $row->registerXPathNamespace('x', $ns);
+
+            // Lấy tất cả ô trong dòng
+            $cells = $row->xpath('./x:c') ?: [];
+
+            foreach ($cells as $cell) {
+                // Xác định vị trí cột A, B, C...
+                $ref = (string)$cell['r'];
+                $type = (string)$cell['t'];
+
+                if (!preg_match('/^([A-Z]+)/i', $ref, $match)) {
+                    continue;
+                }
+
+                $col = 0;
+
+                foreach (str_split(strtoupper($match[1])) as $letter) {
+                    $col = $col * 26 + ord($letter) - 64;
+                }
+
+                $col--;
+
+                $children = $cell->children($ns);
+                $value = (string)$children->v;
+
+                // Chuỗi lưu trong sharedStrings.xml
+                if ($type === 's') {
+                    $value = $shared[(int)$value] ?? '';
+                }
+
+                // Chuỗi lưu trực tiếp trong ô Excel
+                elseif ($type === 'inlineStr') {
+                    $children->is->registerXPathNamespace('x', $ns);
+
+                    $parts = $children->is->xpath('.//x:t') ?: [];
+
+                    $value = implode(
+                        '',
+                        array_map(
+                            fn($part) => (string)$part,
+                            $parts
+                        )
+                    );
+                }
+
+                // Cột C = ngày sinh
+                // Chuyển ngày dạng số Excel sang YYYY-MM-DD
+                if (
+                    $col === 2 &&
+                    $value !== '' &&
+                    is_numeric($value)
+                ) {
+                    $days = (int)floor((float)$value);
+
+                    if ($days > 0 && $days < 2958466) {
+                        $value = (
+                            new DateTimeImmutable('1899-12-30')
+                        )
+                            ->modify('+' . $days . ' days')
+                            ->format('Y-m-d');
+                    }
+                }
+
+                $vals[$col] = $value;
             }
 
-            $shared[] = $v;
-        }
-    }
-
-    $sheet = $z->getFromName('xl/worksheets/sheet1.xml');
-    $z->close();
-
-    if ($sheet === false) {
-        throw new RuntimeException('Không tìm thấy sheet1.');
-    }
-
-    $xml = simplexml_load_string($sheet);
-
-    if ($xml === false) {
-        throw new RuntimeException('Không đọc được dữ liệu Excel.');
-    }
-
-    $all = [];
-
-    foreach ($xml->sheetData->row as $row) {
-        $vals = [];
-
-        foreach ($row->c as $c) {
-            $ref = (string)$c['r'];
-
-            preg_match('/^[A-Z]+/', $ref, $m);
-
-            $col = 0;
-
-            foreach (str_split($m[0] ?? 'A') as $ch) {
-                $col = $col * 26 + ord($ch) - 64;
+            if (empty($vals)) {
+                continue;
             }
 
-            $val = (string)$c->v;
-
-            if ((string)$c['t'] === 's') {
-                $val = $shared[(int)$val] ?? '';
-            } elseif ((string)$c['t'] === 'inlineStr') {
-                $val = (string)$c->is->t;
-            }
-
-            $vals[$col - 1] = $val;
-        }
-
-        if ($vals) {
+            // Bổ sung các ô trống để không lệch cột
             $last = max(array_keys($vals));
 
             $all[] = array_map(
@@ -115,11 +203,18 @@ function docBang(string $file, string $ext): array
                 range(0, $last)
             );
         }
+
+        if (empty($all)) {
+            throw new RuntimeException(
+                'File Excel không có dữ liệu.'
+            );
+        }
+
+        return [array_shift($all), $all];
+    } finally {
+        $zip->close();
     }
-
-    return [array_shift($all), $all];
 }
-
 
 // Kiểm tra dữ liệu học sinh trước khi tạo hồ sơ
 function xuLyImport(clsMHoSo $model, int $ky, string $user): array
@@ -247,13 +342,17 @@ function xuLyImport(clsMHoSo $model, int $ky, string $user): array
         }
 
         // Thông tin liên hệ không bắt buộc nhưng phải đúng định dạng nếu có
-        if ($r['soDienThoai'] !== '' &&
-            !preg_match('/^0[0-9]{9}$/D', $r['soDienThoai'])) {
+        if (
+            $r['soDienThoai'] !== '' &&
+            !preg_match('/^0[0-9]{9}$/D', $r['soDienThoai'])
+        ) {
             $errors[] = 'Số điện thoại không hợp lệ';
         }
 
-        if ($r['email'] !== '' &&
-            !filter_var($r['email'], FILTER_VALIDATE_EMAIL)) {
+        if (
+            $r['email'] !== '' &&
+            !filter_var($r['email'], FILTER_VALIDATE_EMAIL)
+        ) {
             $errors[] = 'Email không hợp lệ';
         }
 
