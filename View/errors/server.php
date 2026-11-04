@@ -1,0 +1,1 @@
+<section class="card"><h2>Không thể xử lý yêu cầu</h2><p>Vui lòng kiểm tra kết nối cơ sở dữ liệu hoặc thử lại.</p><a class="btn" href="<?= \App\Core\Security::escape($baseUrl) ?>?route=phancong">Quay lại</a></section>
